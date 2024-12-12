@@ -20,7 +20,8 @@
 #include <unordered_map>
 #include <fstream>
 #include "nlohmann/json.hpp"
-#include <QtCore/QTimer>
+#include <chrono>
+
 
 
 using boost::asio::ip::udp;
@@ -112,7 +113,7 @@ cv::Mat HBITMAPToMat(HBITMAP hBitmap) {
     DeleteDC(hdc);
 
     cv::cvtColor(mat, mat, cv::COLOR_BGRA2BGR);  // Convert BGRA to BGR
-    cv::resize(mat, mat, cv::Size(), 1.0, 1.0); // Scale down the image to 25% of the original size
+    cv::resize(mat, mat, cv::Size(), 0.5, 0.5); // Scale down the image to 25% of the original size
 
     return mat.clone();  // Clone the image to ensure the data is independent
 }
@@ -233,50 +234,41 @@ void UpdateColorDisplay(cv::Scalar color) {
 }
 
 
-// Start the screen capture with a timer
+// Start the screen capture in a separate thread
 void StartScreenCapture() {
     if (!capturing) {
         capturing = true;
+        std::thread([]() {
+            while (capturing) {
+                try {
+                    // Capture the screen
+                    HBITMAP hBitmap = CaptureScreen();
 
-        // Set up a timer to trigger screen capture periodically
-        captureTimer = new QTimer();
-        QObject::connect(captureTimer, &QTimer::timeout, []() {
-            if (!capturing) {
-                return; // Skip execution if capturing has been stopped
+                    // Convert HBITMAP to cv::Mat
+                    cv::Mat img = HBITMAPToMat(hBitmap);
+                    cv::Scalar dominantColor = getDominantColor(img);
+
+                    // Send the color to WiZ light
+                    SendColorToWiZ(dominantColor);
+
+                    // Update the color preview box in the GUI
+                    UpdateColorDisplay(dominantColor);
+
+                    DeleteObject(hBitmap);
+
+                    // Sleep for a short interval to reduce CPU usage
+                    std::this_thread::sleep_for(std::chrono::milliseconds(0));
+                } catch (const std::exception& ex) {
+                    std::cerr << "Exception in screen capture process: " << ex.what() << std::endl;
+                }
             }
-            try {
-                // Capture the screen
-                HBITMAP hBitmap = CaptureScreen();
-
-                // Convert HBITMAP to cv::Mat
-                cv::Mat img = HBITMAPToMat(hBitmap);
-                cv::Scalar dominantColor = getDominantColor(img);
-
-                // Send the color to WiZ light (for demonstration)
-                SendColorToWiZ(dominantColor);
-
-                // Update the color preview box in the GUI
-                UpdateColorDisplay(dominantColor);
-
-                DeleteObject(hBitmap);
-            } catch (const std::exception& ex) {
-                std::cerr << "Exception in screen capture process: " << ex.what() << std::endl;
-            }
-        });
-        captureTimer->start(10); // Trigger screen capture every 100 milliseconds
+        }).detach();
     }
 }
 
 // Stop the screen capture
 void StopScreenCapture() {
-    if (capturing) {
-        capturing = false;
-        if (captureTimer) {
-            captureTimer->stop();
-            delete captureTimer;
-            captureTimer = nullptr;
-        }
-    }
+    capturing = false;
 }
 
 
