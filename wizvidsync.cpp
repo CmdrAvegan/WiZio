@@ -17,6 +17,7 @@
 #include <QtWidgets/QCheckBox>
 #include <QtWidgets/QSlider>
 #include <QtWidgets/QMessageBox>
+#include <QtWidgets/QComboBox>
 #include <unordered_map>
 #include <fstream>
 #include "nlohmann/json.hpp"
@@ -48,6 +49,10 @@ QCheckBox* brightnessCheckbox;
 QSlider* darknessSlider;
 QCheckBox* colorBoostCheckbox;
 QSlider* colorBoostSlider;
+QSlider* darknessThresholdSlider;     // global variable for the color to darkness slider
+QCheckBox* dynamicBrightnessCheckbox; // global variable for the dynamic brightness checkbox
+QComboBox* leftLightComboBox;         // Global variable for left light
+QComboBox* rightLightComboBox;        // Global variable for right light
 boost::asio::io_context ioContext;
 udp::socket* udpSocket;
 std::atomic<bool> adjustBrightness(false);  // Flag to enable/disable brightness adjustment
@@ -88,7 +93,6 @@ HBITMAP CaptureScreen() {
 }
 
 
-// Function to convert HBITMAP to cv::Mat
 // Function to convert HBITMAP to cv::Mat with scaling down
 cv::Mat HBITMAPToMat(HBITMAP hBitmap) {
     BITMAP bmp;
@@ -168,6 +172,16 @@ cv::Scalar getDominantColor(const cv::Mat& image) {
     return cv::Scalar(dominantColor[0], dominantColor[1], dominantColor[2]); // BGR to Scalar
 }
 
+cv::Scalar getAverageColorBrightness(const cv::Mat& image) {
+    if (image.empty()) {
+        std::cerr << "Error: Image is empty" << std::endl;
+        return cv::Scalar(0, 0, 0); // Return black if error
+    }
+
+    cv::Scalar avgBrightness = cv::mean(image); // Calculate the average color brightness
+
+    return avgBrightness; // Return the average brightness
+}
 
 void InitUDPSocket() {
     udpSocket = new udp::socket(ioContext, udp::endpoint(udp::v4(), 0));
@@ -180,7 +194,7 @@ void CleanupUDPSocket() {
 
 std::atomic<bool> lightIsOff(false);  // Track the state of the light
 
-void SendColorToWiZ(cv::Scalar color) {
+void SendColorToWiZ(cv::Scalar color, double averageBrightness, const QString& lightIp) {
     if (colorBoostEnabled) {
         // Apply color boost
         color = boostSaturation(color, colorBoostIntensity);
@@ -191,6 +205,12 @@ void SendColorToWiZ(cv::Scalar color) {
     int blue = static_cast<int>(color[0]);
 
     int brightness = 255;  // Default brightness
+    int darknessThresholdValue = darknessThresholdSlider->value();  // Get the user-defined threshold value
+
+    if (dynamicBrightnessCheckbox->isChecked()) {
+        // Calculate the brightness value based on average brightness
+        brightness = std::clamp(static_cast<int>((averageBrightness / 255.0) * 100), 1, 100);
+    }
 
     if (red == 0 && green == 0 && blue == 0) {
         // Set brightness to 0 and color to (1, 1, 1) if the color is black
@@ -201,7 +221,7 @@ void SendColorToWiZ(cv::Scalar color) {
         // Adjust brightness based on how close the color is to black
         if (adjustBrightness) {
             int maxColorValue = std::max({red, green, blue});
-            if (maxColorValue < 100) { // Adjust this threshold as needed
+            if (maxColorValue < darknessThresholdValue) { // Use the user-defined threshold value
                 int colorBrightness = static_cast<int>(0.299 * red + 0.587 * green + 0.114 * blue);
                 brightness = std::max(1, 100 - (darknessThreshold.load() * (255 - colorBrightness) / 255));
             }
@@ -215,11 +235,11 @@ void SendColorToWiZ(cv::Scalar color) {
         .arg(blue)
         .arg(brightness);
 
-    for (const Light& light : lights) {
-        udp::endpoint endpoint(boost::asio::ip::make_address(light.ipAddress.toStdString()), 38899);  // Default WiZ UDP port
-        udpSocket->send_to(boost::asio::buffer(json.toStdString()), endpoint);
-    }
+    udp::endpoint endpoint(boost::asio::ip::make_address(lightIp.toStdString()), 38899);  // Default WiZ UDP port
+    udpSocket->send_to(boost::asio::buffer(json.toStdString()), endpoint);
 }
+
+
 
 // Function to update the color preview box
 void UpdateColorDisplay(cv::Scalar color) {
@@ -246,18 +266,45 @@ void StartScreenCapture() {
 
                     // Convert HBITMAP to cv::Mat
                     cv::Mat img = HBITMAPToMat(hBitmap);
-                    cv::Scalar dominantColor = getDominantColor(img);
 
-                    // Send the color to WiZ light
-                    SendColorToWiZ(dominantColor);
+                    // Split the image into left and right halves
+                    cv::Mat leftHalf = img(cv::Rect(0, 0, img.cols / 2, img.rows));
+                    cv::Mat rightHalf = img(cv::Rect(img.cols / 2, 0, img.cols / 2, img.rows));
+
+                    // Calculate the dominant color and average brightness for each half
+                    cv::Scalar leftColor = getDominantColor(leftHalf);
+                    cv::Scalar rightColor = getDominantColor(rightHalf);
+                    cv::Scalar leftAvgBrightness = getAverageColorBrightness(leftHalf);
+                    cv::Scalar rightAvgBrightness = getAverageColorBrightness(rightHalf);
+
+                    // Calculate average brightness
+                    double leftAverageBrightness = (leftAvgBrightness[0] + leftAvgBrightness[1] + leftAvgBrightness[2]) / 3.0;
+                    double rightAverageBrightness = (rightAvgBrightness[0] + rightAvgBrightness[1] + rightAvgBrightness[2]) / 3.0;
+
+                    if (leftLightComboBox->currentIndex() == 0 && rightLightComboBox->currentIndex() == 0) {
+                        // Both set to "None", use all lights
+                        for (const Light& light : lights) {
+                            SendColorToWiZ(leftColor, leftAverageBrightness, light.ipAddress);
+                        }
+                    } else {
+                        // Send colors and brightness to respective lights
+                        if (leftLightComboBox->currentIndex() > 0) { // > 0 to exclude "None"
+                            QString leftLightIp = lights[leftLightComboBox->currentIndex() - 1].ipAddress; // -1 to account for "None"
+                            SendColorToWiZ(leftColor, leftAverageBrightness, leftLightIp);
+                        }
+                        if (rightLightComboBox->currentIndex() > 0) { // > 0 to exclude "None"
+                            QString rightLightIp = lights[rightLightComboBox->currentIndex() - 1].ipAddress; // -1 to account for "None"
+                            SendColorToWiZ(rightColor, rightAverageBrightness, rightLightIp);
+                        }
+                    }
 
                     // Update the color preview box in the GUI
-                    UpdateColorDisplay(dominantColor);
+                    UpdateColorDisplay(leftColor);
 
                     DeleteObject(hBitmap);
 
                     // Sleep for a short interval to reduce CPU usage
-                    std::this_thread::sleep_for(std::chrono::milliseconds(0));
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 } catch (const std::exception& ex) {
                     std::cerr << "Exception in screen capture process: " << ex.what() << std::endl;
                 }
@@ -265,6 +312,9 @@ void StartScreenCapture() {
         }).detach();
     }
 }
+
+
+
 
 // Stop the screen capture
 void StopScreenCapture() {
@@ -301,6 +351,10 @@ void AddLight() {
         if (ok && !ip.isEmpty()) {
             lights.push_back({name, ip});
             lightList->addItem(name);
+
+            // Update combo boxes
+            leftLightComboBox->addItem(name);
+            rightLightComboBox->addItem(name);
         }
     }
 }
@@ -312,8 +366,13 @@ void RemoveLight() {
         int row = lightList->row(item);
         lights.erase(lights.begin() + row);
         delete lightList->takeItem(row);
+
+        // Update combo boxes
+        leftLightComboBox->removeItem(row + 1);  // +1 to account for "None" option
+        rightLightComboBox->removeItem(row + 1);
     }
 }
+
 
 void SelectScreenRegion() {
     HINSTANCE hInstance = GetModuleHandle(nullptr);
@@ -447,14 +506,15 @@ void ResetToDefaults() {
     adjustBrightness = DEFAULT_ADJUST_BRIGHTNESS;
     colorBoostEnabled = DEFAULT_COLOR_BOOST_ENABLED;
     lights.clear();
+
     // Update the UI elements to reflect these defaults
     brightnessCheckbox->setChecked(DEFAULT_ADJUST_BRIGHTNESS);
     darknessSlider->setValue(DEFAULT_DARKNESS_THRESHOLD);
     colorBoostCheckbox->setChecked(DEFAULT_COLOR_BOOST_ENABLED);
     colorBoostSlider->setValue(DEFAULT_COLOR_BOOST_INTENSITY);
+    darknessThresholdSlider->setValue(20); // Reset the darkness threshold slider to default value
     lightList->clear();
 }
-
 
 // Function to save settings to a JSON file
 void SaveSettings() {
@@ -463,6 +523,8 @@ void SaveSettings() {
     // Save darkness threshold and color boost intensity
     settings["darknessThreshold"] = darknessThreshold.load();
     settings["colorBoostIntensity"] = colorBoostIntensity.load();
+    settings["darknessThresholdValue"] = darknessThresholdSlider->value(); // Save the darkness threshold slider value
+    settings["dynamicBrightnessEnabled"] = dynamicBrightnessCheckbox->isChecked(); // Save dynamic brightness state
 
     // Save whether darkness adjustment and color boost are enabled
     settings["adjustBrightness"] = adjustBrightness.load();
@@ -478,6 +540,7 @@ void SaveSettings() {
     std::ofstream settingsFile("settings.json");
     settingsFile << settings.dump(4); // Pretty-print with 4 spaces
 }
+
 
 // Function to create a default settings file
 void CreateDefaultSettingsFile() {
@@ -505,6 +568,8 @@ void LoadSettings() {
         // Load darkness threshold and color boost intensity
         darknessThreshold = settings.value("darknessThreshold", DEFAULT_DARKNESS_THRESHOLD);
         colorBoostIntensity = settings.value("colorBoostIntensity", DEFAULT_COLOR_BOOST_INTENSITY);
+        int darknessThresholdValue = settings.value("darknessThresholdValue", 20); // Load the darkness threshold slider value
+        bool dynamicBrightnessEnabled = settings.value("dynamicBrightnessEnabled", false); // Load dynamic brightness state
 
         // Load whether darkness adjustment and color boost are enabled
         adjustBrightness = settings.value("adjustBrightness", DEFAULT_ADJUST_BRIGHTNESS);
@@ -513,9 +578,15 @@ void LoadSettings() {
         // Load lights
         lights.clear();
         lightList->clear();
+        leftLightComboBox->clear();
+        rightLightComboBox->clear();
+        leftLightComboBox->addItem("None");
+        rightLightComboBox->addItem("None");
         for (const auto& light : settings["lights"]) {
             lights.push_back({QString::fromStdString(light["name"]), QString::fromStdString(light["ipAddress"])});
             lightList->addItem(QString::fromStdString(light["name"]));
+            leftLightComboBox->addItem(QString::fromStdString(light["name"]));
+            rightLightComboBox->addItem(QString::fromStdString(light["name"]));
         }
 
         // Update UI elements to reflect loaded settings
@@ -523,6 +594,8 @@ void LoadSettings() {
         if (darknessSlider) darknessSlider->setValue(darknessThreshold);
         if (colorBoostCheckbox) colorBoostCheckbox->setChecked(colorBoostEnabled);
         if (colorBoostSlider) colorBoostSlider->setValue(colorBoostIntensity);
+        if (darknessThresholdSlider) darknessThresholdSlider->setValue(darknessThresholdValue);
+        if (dynamicBrightnessCheckbox) dynamicBrightnessCheckbox->setChecked(dynamicBrightnessEnabled);
 
         std::cout << "Settings loaded successfully." << std::endl;
     } else {
@@ -530,6 +603,8 @@ void LoadSettings() {
         CreateDefaultSettingsFile();
     }
 }
+
+
 
 
 void SetupUI(QVBoxLayout* layout) {
@@ -571,6 +646,14 @@ void SetupUI(QVBoxLayout* layout) {
     layout->addWidget(new QLabel("Darkness Intensity"));
     layout->addWidget(darknessSlider);
 
+    // Add a new slider for the darkness threshold
+    QLabel* darknessThresholdLabel = new QLabel("Darkness Threshold:");
+    layout->addWidget(darknessThresholdLabel);
+    darknessThresholdSlider = new QSlider(Qt::Horizontal);
+    darknessThresholdSlider->setRange(0, 255); // Set the range to 0-255
+    darknessThresholdSlider->setValue(20); // Default value
+    layout->addWidget(darknessThresholdSlider);
+
     // Add color boost controls
     colorBoostCheckbox = new QCheckBox("Enable Color Boost");
     layout->addWidget(colorBoostCheckbox);
@@ -578,6 +661,23 @@ void SetupUI(QVBoxLayout* layout) {
     colorBoostSlider->setRange(0, 100);
     layout->addWidget(new QLabel("Color Boost Intensity"));
     layout->addWidget(colorBoostSlider);
+
+    // Add dynamic brightness checkbox
+    dynamicBrightnessCheckbox = new QCheckBox("Enable Dynamic Brightness");
+    layout->addWidget(dynamicBrightnessCheckbox);
+
+    // Add combo boxes for selecting lights for left and right halves
+    QLabel* leftLightLabel = new QLabel("Select Light for Left Half:");
+    layout->addWidget(leftLightLabel);
+    leftLightComboBox = new QComboBox();
+    leftLightComboBox->addItem("None");
+    layout->addWidget(leftLightComboBox);
+
+    QLabel* rightLightLabel = new QLabel("Select Light for Right Half:");
+    layout->addWidget(rightLightLabel);
+    rightLightComboBox = new QComboBox();
+    rightLightComboBox->addItem("None");
+    layout->addWidget(rightLightComboBox);
 
     // Add reset to defaults button
     QPushButton* resetButton = new QPushButton("Reset to Defaults");
@@ -600,6 +700,12 @@ void SetupUI(QVBoxLayout* layout) {
     QObject::connect(colorBoostSlider, &QSlider::valueChanged, [](int value) {
         colorBoostIntensity = value;
     });
+    QObject::connect(darknessThresholdSlider, &QSlider::valueChanged, [](int value) {
+        // Use the new threshold value as needed
+    });
+    QObject::connect(dynamicBrightnessCheckbox, &QCheckBox::stateChanged, [](int state) {
+        // Handle dynamic brightness checkbox state change
+    });
     QObject::connect(selectRegionButton, &QPushButton::clicked, []() {
         SelectScreenRegion();
     });
@@ -612,6 +718,9 @@ void SetupUI(QVBoxLayout* layout) {
         }
     });
 }
+
+
+
 
 
 int main(int argc, char* argv[]) {
