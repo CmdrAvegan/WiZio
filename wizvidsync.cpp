@@ -22,6 +22,8 @@
 #include <fstream>
 #include "nlohmann/json.hpp"
 #include <chrono>
+#include <opencv2/imgproc.hpp>
+
 
 
 
@@ -42,6 +44,8 @@ struct Vec3bComparator {
 // Global variables
 std::atomic<bool> capturing(false);  // Used to control screen capture
 QLabel* colorDisplay;                // Global pointer to the color display label
+QLabel* leftColorDisplay;            // Global pointer to the left color display label
+QLabel* rightColorDisplay;           // Global pointer to the right color display label
 QLabel* colorLabel;                  // Global pointer to the color label text
 QLabel* lightsLabel;                 // Global pointer to the Light's label text
 QListWidget* lightList;              // List widget to display lights
@@ -53,20 +57,104 @@ QSlider* darknessThresholdSlider;     // global variable for the color to darkne
 QCheckBox* dynamicBrightnessCheckbox; // global variable for the dynamic brightness checkbox
 QComboBox* leftLightComboBox;         // Global variable for left light
 QComboBox* rightLightComboBox;        // Global variable for right light
+QCheckBox* ambilightModeCheckbox;     // Global variable for Ambilight mode
+QLabel* leftColorLabel;
+QLabel* rightColorLabel;
+QSlider* mainImageScaleSlider = nullptr;
+QSlider* motionImageScaleSlider = nullptr;
+QSlider* patternImageScaleSlider = nullptr;
 boost::asio::io_context ioContext;
 udp::socket* udpSocket;
 std::atomic<bool> adjustBrightness(false);  // Flag to enable/disable brightness adjustment
 std::atomic<int> darknessThreshold(30);     // Threshold for darkness intensity adjustment
 std::atomic<bool> colorBoostEnabled(false);  // Flag to enable/disable color boost
 std::atomic<int> colorBoostIntensity(20);   // Intensity of the color boost
+std::atomic<int> maxBrightness(100);        // Maximum brightness flag
 RECT selectedRegion;
 bool selectingRegion = false;
 bool regionSelected = false;
-// Global timer for screen capture
-QTimer* captureTimer = nullptr;
-
-
+std::atomic<bool> previewsOpen(false);
+std::atomic<bool> ambilightModeEnabled(false);
 std::vector<Light> lights;  // Vector to store the lights
+// Global variables for scaling factors
+std::atomic<double> mainImageScale(0.5);  // Default scaling factor for main image
+std::atomic<double> motionImageScale(0.5); // Default scaling for motion images
+std::atomic<double> patternImageScale(0.5); // Default scaling for pattern images
+std::thread leftThread;
+std::thread rightThread;
+std::atomic<bool> leftThreadRunning(false);
+std::atomic<bool> rightThreadRunning(false);
+
+cv::Mat previousFrame;  // To store the previous frame
+
+double AdjustBrightnessWithMotion(double brightness, double motion) {
+    double motionScale = std::min(motion / 20.0, 1.0);  // Normalize motion intensity
+    return std::clamp(brightness + motionScale * 50, 1.0, 100.0);  // Adjust brightness
+}
+
+
+cv::Mat calculateOpticalFlow(const cv::Mat& prev, const cv::Mat& next) {
+    cv::Mat flow;
+    cv::calcOpticalFlowFarneback(prev, next, flow, 0.5, 3, 15, 3, 5, 1.2, 0);
+    return flow;
+}
+
+std::vector<cv::Point2f> calculateOpticalFlowLK(const cv::Mat& prev, const cv::Mat& next) {
+    std::vector<cv::Point2f> prevPoints, nextPoints;
+    cv::goodFeaturesToTrack(prev, prevPoints, 100, 0.01, 10);
+    std::vector<uchar> status;
+    std::vector<float> err;
+    cv::calcOpticalFlowPyrLK(prev, next, prevPoints, nextPoints, status, err);
+    return nextPoints;
+}
+
+
+cv::Mat calculateLBP(const cv::Mat& src) {
+    cv::Mat lbpImage;
+    src.copyTo(lbpImage);
+    for (int i = 1; i < src.rows - 1; i++) {
+        for (int j = 1; j < src.cols - 1; j++) {
+            uchar center = src.at<uchar>(i, j);
+            unsigned char code = 0;
+            code |= (src.at<uchar>(i - 1, j - 1) > center) << 7;
+            code |= (src.at<uchar>(i - 1, j) > center) << 6;
+            code |= (src.at<uchar>(i - 1, j + 1) > center) << 5;
+            code |= (src.at<uchar>(i, j + 1) > center) << 4;
+            code |= (src.at<uchar>(i + 1, j + 1) > center) << 3;
+            code |= (src.at<uchar>(i + 1, j) > center) << 2;
+            code |= (src.at<uchar>(i + 1, j - 1) > center) << 1;
+            code |= (src.at<uchar>(i, j - 1) > center) << 0;
+            lbpImage.at<uchar>(i, j) = code;
+        }
+    }
+    return lbpImage;
+}
+
+std::vector<cv::Mat> calculateMultiScaleLBP(const cv::Mat& src, const std::vector<int>& radii) {
+    std::vector<cv::Mat> lbpImages;
+    for (int radius : radii) {
+        cv::Mat lbpImage;
+        src.copyTo(lbpImage);
+        for (int i = radius; i < src.rows - radius; i++) {
+            for (int j = radius; j < src.cols - radius; j++) {
+                uchar center = src.at<uchar>(i, j);
+                unsigned char code = 0;
+                code |= (src.at<uchar>(i - radius, j - radius) > center) << 7;
+                code |= (src.at<uchar>(i - radius, j) > center) << 6;
+                code |= (src.at<uchar>(i - radius, j + radius) > center) << 5;
+                code |= (src.at<uchar>(i, j + radius) > center) << 4;
+                code |= (src.at<uchar>(i + radius, j + radius) > center) << 3;
+                code |= (src.at<uchar>(i + radius, j) > center) << 2;
+                code |= (src.at<uchar>(i + radius, j - radius) > center) << 1;
+                code |= (src.at<uchar>(i, j - radius) > center) << 0;
+                lbpImage.at<uchar>(i, j) = code;
+            }
+        }
+        lbpImages.push_back(lbpImage);
+    }
+    return lbpImages;
+}
+
 
 // Function to capture the screen using GDI
 HBITMAP CaptureScreen() {
@@ -117,7 +205,7 @@ cv::Mat HBITMAPToMat(HBITMAP hBitmap) {
     DeleteDC(hdc);
 
     cv::cvtColor(mat, mat, cv::COLOR_BGRA2BGR);  // Convert BGRA to BGR
-    cv::resize(mat, mat, cv::Size(), 0.5, 0.5); // Scale down the image to 25% of the original size
+    cv::resize(mat, mat, cv::Size(), mainImageScale.load(), mainImageScale.load()); // Scale down the image based on user preference
 
     return mat.clone();  // Clone the image to ensure the data is independent
 }
@@ -138,6 +226,7 @@ cv::Scalar boostSaturation(cv::Scalar color, int boostIntensity) {
 
 // Function to calculate the dominant color by finding the most frequent color
 cv::Scalar getDominantColor(const cv::Mat& image) {
+    
     if (image.empty()) {
         std::cerr << "Error: Image is empty" << std::endl;
         return cv::Scalar(0, 0, 0); // Return black if error
@@ -194,9 +283,8 @@ void CleanupUDPSocket() {
 
 std::atomic<bool> lightIsOff(false);  // Track the state of the light
 
-void SendColorToWiZ(cv::Scalar color, double averageBrightness, const QString& lightIp) {
+void SendColorToWiZ(cv::Scalar color, double averageBrightness, const QString& lightIp, const cv::Mat& lbpImage, const cv::Mat& flowMagnitude) {
     if (colorBoostEnabled) {
-        // Apply color boost
         color = boostSaturation(color, colorBoostIntensity);
     }
 
@@ -204,41 +292,73 @@ void SendColorToWiZ(cv::Scalar color, double averageBrightness, const QString& l
     int green = static_cast<int>(color[1]);
     int blue = static_cast<int>(color[0]);
 
-    int brightness = 255;  // Default brightness
-    int darknessThresholdValue = darknessThresholdSlider->value();  // Get the user-defined threshold value
+    int brightness;
 
-    if (dynamicBrightnessCheckbox->isChecked()) {
-        // Calculate the brightness value based on average brightness
+    // Directly use max brightness if adjust brightness is off
+    if (!adjustBrightness) {
+        brightness = maxBrightness.load();
+    } else if (dynamicBrightnessCheckbox->isChecked()) {
+        // Base brightness adjustment based on average brightness
         brightness = std::clamp(static_cast<int>((averageBrightness / 255.0) * 100), 1, 100);
+
+        // Measure of texture complexity and average flow magnitude
+        double lbpComplexity = cv::mean(lbpImage)[0];
+        double flowIntensity = cv::mean(flowMagnitude)[0];
+
+        // Adjust further based on texture and motion
+        if (lbpComplexity > 50 || flowIntensity > 20) {  // Example thresholds
+            brightness = std::min(brightness + 20, 100);
+        } else {
+            brightness = std::max(brightness - 20, 1);
+        }
+
+        // Apply additional darkness threshold adjustment
+        int darknessThresholdValue = darknessThresholdSlider->value();
+        if (brightness < darknessThresholdValue) {
+            int adjustment = darknessSlider->value();
+            brightness = std::max(1, brightness - adjustment);
+        }
+    } else {
+        // Static brightness adjustment using darkness threshold
+        int maxColorValue = std::max({red, green, blue});
+        int darknessThresholdValue = darknessThresholdSlider->value();
+        if (maxColorValue < darknessThresholdValue) {
+            int colorBrightness = static_cast<int>(0.299 * red + 0.587 * green + 0.114 * blue);
+            brightness = std::max(1, 100 - (darknessThreshold.load() * (255 - colorBrightness) / 255));
+        } else {
+            brightness = maxBrightness.load();
+        }
     }
 
+    // Disable calculations of adjusted brightness and average brightness if their options are not enabled
+    if (!adjustBrightness) {
+        averageBrightness = 0; // Reset averageBrightness to 0 as it should not be calculated
+    }
+
+    // Skip calculations for adjustedBrightness if adjustBrightness is false
+    double adjustedBrightness = (adjustBrightness) ? (brightness / 100.0) * 255 : (maxBrightness.load() / 100.0) * 255;
+
     if (red == 0 && green == 0 && blue == 0) {
-        // Set brightness to 0 and color to (1, 1, 1) if the color is black
-        red = green = blue = 1;
-        brightness = 0;
+        red = green = blue = 1;  // Avoid "off" state being sent as (0,0,0)
+        adjustedBrightness = 0;
         lightIsOff = true;
     } else {
-        // Adjust brightness based on how close the color is to black
-        if (adjustBrightness) {
-            int maxColorValue = std::max({red, green, blue});
-            if (maxColorValue < darknessThresholdValue) { // Use the user-defined threshold value
-                int colorBrightness = static_cast<int>(0.299 * red + 0.587 * green + 0.114 * blue);
-                brightness = std::max(1, 100 - (darknessThreshold.load() * (255 - colorBrightness) / 255));
-            }
-        }
         lightIsOff = false;
     }
 
-    QString json = QString("{\"method\":\"setPilot\",\"params\":{\"r\":%1,\"g\":%2,\"b\":%3,\"dimming\":%4}}")
-        .arg(red)
-        .arg(green)
-        .arg(blue)
-        .arg(brightness);
+    // Debugging output
+    if (adjustBrightness) {
+        std::cout << "Adjusted brightness sent to WiZ light: " << adjustedBrightness << std::endl;
+        std::cout << "Average Brightness: " << averageBrightness << std::endl;
+    }
+    std::cout << "Using max brightness: " << brightness << std::endl;
 
-    udp::endpoint endpoint(boost::asio::ip::make_address(lightIp.toStdString()), 38899);  // Default WiZ UDP port
+    QString json = QString("{\"method\":\"setPilot\",\"params\":{\"r\":%1,\"g\":%2,\"b\":%3,\"dimming\":%4}}")
+        .arg(red).arg(green).arg(blue).arg(adjustedBrightness);
+
+    udp::endpoint endpoint(boost::asio::ip::make_address(lightIp.toStdString()), 38899);
     udpSocket->send_to(boost::asio::buffer(json.toStdString()), endpoint);
 }
-
 
 
 // Function to update the color preview box
@@ -253,74 +373,222 @@ void UpdateColorDisplay(cv::Scalar color) {
     }, Qt::QueuedConnection);
 }
 
+// Function to update the left color preview box
+void UpdateLeftColorDisplay(cv::Scalar color) {
+    int red = std::clamp(static_cast<int>(color[2]), 0, 255);
+    int green = std::clamp(static_cast<int>(color[1]), 0, 255);
+    int blue = std::clamp(static_cast<int>(color[0]), 0, 255);
+    QString style = QString("background-color: rgb(%1, %2, %3);").arg(red).arg(green).arg(blue);
+
+    QMetaObject::invokeMethod(leftColorDisplay, [style]() {
+        leftColorDisplay->setStyleSheet(style);
+    }, Qt::QueuedConnection);
+}
+
+// Function to update the right color preview box
+void UpdateRightColorDisplay(cv::Scalar color) {
+    int red = std::clamp(static_cast<int>(color[2]), 0, 255);
+    int green = std::clamp(static_cast<int>(color[1]), 0, 255);
+    int blue = std::clamp(static_cast<int>(color[0]), 0, 255);
+    QString style = QString("background-color: rgb(%1, %2, %3);").arg(red).arg(green).arg(blue);
+
+    QMetaObject::invokeMethod(rightColorDisplay, [style]() {
+        rightColorDisplay->setStyleSheet(style);
+    }, Qt::QueuedConnection);
+}
+
+
+void ProcessLeftHalf(const cv::Mat& leftHalfColor, const cv::Mat& leftHalfLBP, double& leftBrightness, cv::Scalar& leftColor) {
+    leftColor = getDominantColor(leftHalfColor);
+    std::cout << "Left Thread: adjustBrightness = " << adjustBrightness << ", maxBrightness = " << maxBrightness.load() << std::endl;
+
+    // Only calculate average brightness if adjustBrightness is true
+    if (adjustBrightness) {
+        cv::Scalar avgBrightness = getAverageColorBrightness(leftHalfLBP);
+        leftBrightness = (avgBrightness[0] + avgBrightness[1] + avgBrightness[2]) / 3.0;
+    } else {
+        leftBrightness = maxBrightness.load();
+    }
+}
+
+void ProcessRightHalf(const cv::Mat& rightHalfColor, const cv::Mat& rightHalfLBP, double& rightBrightness, cv::Scalar& rightColor) {
+    rightColor = getDominantColor(rightHalfColor);
+    std::cout << "Right Thread: adjustBrightness = " << adjustBrightness << ", maxBrightness = " << maxBrightness.load() << std::endl;
+
+    // Only calculate average brightness if adjustBrightness is true
+    if (adjustBrightness) {
+        cv::Scalar avgBrightness = getAverageColorBrightness(rightHalfLBP);
+        rightBrightness = (avgBrightness[0] + avgBrightness[1] + avgBrightness[2]) / 3.0;
+    } else {
+        rightBrightness = maxBrightness.load();
+    }
+}
+
+
+void ShowColorDisplay(QLabel* label, QLabel* textLabel) {
+    label->show();
+    textLabel->show();
+}
+
+void HideColorDisplay(QLabel* label, QLabel* textLabel) {
+    label->hide();
+    textLabel->hide();
+}
+
 
 // Start the screen capture in a separate thread
 void StartScreenCapture() {
     if (!capturing) {
         capturing = true;
-        std::thread([]() {
-            while (capturing) {
-                try {
+
+        // Show or hide color displays based on the user's light configuration
+        if (leftLightComboBox->currentIndex() > 0) {
+            ShowColorDisplay(leftColorDisplay, leftColorLabel);
+        } else {
+            HideColorDisplay(leftColorDisplay, leftColorLabel);
+        }
+
+        if (rightLightComboBox->currentIndex() > 0) {
+            ShowColorDisplay(rightColorDisplay, rightColorLabel);
+        } else {
+            HideColorDisplay(rightColorDisplay, rightColorLabel);
+        }
+
+        if (leftLightComboBox->currentIndex() == 0 && rightLightComboBox->currentIndex() == 0) {
+            ShowColorDisplay(colorDisplay, colorLabel);
+        } else {
+            HideColorDisplay(colorDisplay, colorLabel);
+        }
+
+        // Launch persistent left thread only if left light is defined
+        if (leftLightComboBox->currentIndex() > 0 && !leftThreadRunning) {
+            leftThreadRunning = true;
+            leftThread = std::thread([]() {
+                while (leftThreadRunning && capturing) {
                     // Capture the screen
                     HBITMAP hBitmap = CaptureScreen();
-
-                    // Convert HBITMAP to cv::Mat
                     cv::Mat img = HBITMAPToMat(hBitmap);
+                    cv::Mat gray;
+                    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
 
-                    // Split the image into left and right halves
-                    cv::Mat leftHalf = img(cv::Rect(0, 0, img.cols / 2, img.rows));
-                    cv::Mat rightHalf = img(cv::Rect(img.cols / 2, 0, img.cols / 2, img.rows));
+                    // Split the image into left half
+                    cv::Mat leftHalfColor = img(cv::Rect(0, 0, img.cols / 2, img.rows));
+                    cv::Scalar leftColor = getDominantColor(leftHalfColor);
 
-                    // Calculate the dominant color and average brightness for each half
-                    cv::Scalar leftColor = getDominantColor(leftHalf);
-                    cv::Scalar rightColor = getDominantColor(rightHalf);
-                    cv::Scalar leftAvgBrightness = getAverageColorBrightness(leftHalf);
-                    cv::Scalar rightAvgBrightness = getAverageColorBrightness(rightHalf);
+                    double leftAverageBrightness = 0;
+                    if (adjustBrightness) {
+                        leftAverageBrightness = (cv::mean(leftHalfColor)[0] +
+                                                 cv::mean(leftHalfColor)[1] +
+                                                 cv::mean(leftHalfColor)[2]) / 3.0;
 
-                    // Calculate average brightness
-                    double leftAverageBrightness = (leftAvgBrightness[0] + leftAvgBrightness[1] + leftAvgBrightness[2]) / 3.0;
-                    double rightAverageBrightness = (rightAvgBrightness[0] + rightAvgBrightness[1] + rightAvgBrightness[2]) / 3.0;
-
-                    if (leftLightComboBox->currentIndex() == 0 && rightLightComboBox->currentIndex() == 0) {
-                        // Both set to "None", use all lights
-                        for (const Light& light : lights) {
-                            SendColorToWiZ(leftColor, leftAverageBrightness, light.ipAddress);
-                        }
-                    } else {
-                        // Send colors and brightness to respective lights
-                        if (leftLightComboBox->currentIndex() > 0) { // > 0 to exclude "None"
-                            QString leftLightIp = lights[leftLightComboBox->currentIndex() - 1].ipAddress; // -1 to account for "None"
-                            SendColorToWiZ(leftColor, leftAverageBrightness, leftLightIp);
-                        }
-                        if (rightLightComboBox->currentIndex() > 0) { // > 0 to exclude "None"
-                            QString rightLightIp = lights[rightLightComboBox->currentIndex() - 1].ipAddress; // -1 to account for "None"
-                            SendColorToWiZ(rightColor, rightAverageBrightness, rightLightIp);
-                        }
+                        // Debugging output
+                        std::cout << "Left Average Brightness: " << leftAverageBrightness << std::endl;
                     }
 
-                    // Update the color preview box in the GUI
-                    UpdateColorDisplay(leftColor);
+                    // Update left color display if the left light is defined
+                    UpdateLeftColorDisplay(leftColor);
+
+                    // Send color to left light
+                    if (leftLightComboBox->currentIndex() > 0) {
+                        QString leftLightIp = lights[leftLightComboBox->currentIndex() - 1].ipAddress;
+                        SendColorToWiZ(leftColor, leftAverageBrightness, leftLightIp, cv::Mat(), cv::Mat());
+                    }
 
                     DeleteObject(hBitmap);
-
-                    // Sleep for a short interval to reduce CPU usage
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                } catch (const std::exception& ex) {
-                    std::cerr << "Exception in screen capture process: " << ex.what() << std::endl;
+                    std::this_thread::sleep_for(std::chrono::milliseconds(0)); // Adjustable delay
                 }
-            }
-        }).detach();
+            });
+        }
+
+        // Launch persistent right thread only if right light is defined
+        if (rightLightComboBox->currentIndex() > 0 && !rightThreadRunning) {
+            rightThreadRunning = true;
+            rightThread = std::thread([]() {
+                while (rightThreadRunning && capturing) {
+                    // Capture the screen
+                    HBITMAP hBitmap = CaptureScreen();
+                    cv::Mat img = HBITMAPToMat(hBitmap);
+                    cv::Mat gray;
+                    cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+
+                    // Split the image into right half
+                    cv::Mat rightHalfColor = img(cv::Rect(img.cols / 2, 0, img.cols / 2, img.rows));
+                    cv::Scalar rightColor = getDominantColor(rightHalfColor);
+
+                    double rightAverageBrightness = 0;
+                    if (adjustBrightness) {
+                        rightAverageBrightness = (cv::mean(rightHalfColor)[0] +
+                                                  cv::mean(rightHalfColor)[1] +
+                                                  cv::mean(rightHalfColor)[2]) / 3.0;
+
+                        // Debugging output
+                        std::cout << "Right Average Brightness: " << rightAverageBrightness << std::endl;
+                    }
+
+                    // Update right color display if the right light is defined
+                    UpdateRightColorDisplay(rightColor);
+
+                    // Send color to right light
+                    if (rightLightComboBox->currentIndex() > 0) {
+                        QString rightLightIp = lights[rightLightComboBox->currentIndex() - 1].ipAddress;
+                        SendColorToWiZ(rightColor, rightAverageBrightness, rightLightIp, cv::Mat(), cv::Mat());
+                    }
+
+                    DeleteObject(hBitmap);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(0)); // Adjustable delay
+                }
+            });
+        }
+
+        // If no left or right light is defined, use dominant color for all lights
+        if (leftLightComboBox->currentIndex() == 0 && rightLightComboBox->currentIndex() == 0) {
+            std::thread([]() {
+                while (capturing) {
+                    // Capture the screen
+                    HBITMAP hBitmap = CaptureScreen();
+                    cv::Mat img = HBITMAPToMat(hBitmap);
+                    cv::Scalar dominantColor = getDominantColor(img);
+
+                    double avgBrightness = 0;
+                    if (adjustBrightness) {
+                        avgBrightness = (cv::mean(img)[0] +
+                                         cv::mean(img)[1] +
+                                         cv::mean(img)[2]) / 3.0;
+
+                        // Debugging output
+                        std::cout << "Average Brightness: " << avgBrightness << std::endl;
+                    }
+
+                    // Send dominant color to all lights
+                    for (const Light& light : lights) {
+                        SendColorToWiZ(dominantColor, avgBrightness, light.ipAddress, cv::Mat(), cv::Mat());
+                    }
+
+                    // Update main dominant color display
+                    UpdateColorDisplay(dominantColor);
+
+                    DeleteObject(hBitmap);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(0)); // Adjustable delay
+                }
+            }).detach();
+        }
     }
 }
-
-
 
 
 // Stop the screen capture
 void StopScreenCapture() {
     capturing = false;
-}
+    leftThreadRunning = false;
+    rightThreadRunning = false;
 
+    if (leftThread.joinable()) {
+        leftThread.join();
+    }
+    if (rightThread.joinable()) {
+        rightThread.join();
+    }
+}
 
 
 // Win32 Window Procedure
@@ -525,10 +793,15 @@ void SaveSettings() {
     settings["colorBoostIntensity"] = colorBoostIntensity.load();
     settings["darknessThresholdValue"] = darknessThresholdSlider->value(); // Save the darkness threshold slider value
     settings["dynamicBrightnessEnabled"] = dynamicBrightnessCheckbox->isChecked(); // Save dynamic brightness state
+    settings["mainImageScale"] = mainImageScale.load();
+    settings["motionImageScale"] = motionImageScale.load();
+    settings["patternImageScale"] = patternImageScale.load();
 
     // Save whether darkness adjustment and color boost are enabled
     settings["adjustBrightness"] = adjustBrightness.load();
     settings["colorBoostEnabled"] = colorBoostEnabled.load();
+    // Save if ambilight mode is enabled
+    settings["ambilightModeEnabled"] = ambilightModeEnabled.load();
 
     // Save lights
     settings["lights"] = nlohmann::json::array();
@@ -570,10 +843,16 @@ void LoadSettings() {
         colorBoostIntensity = settings.value("colorBoostIntensity", DEFAULT_COLOR_BOOST_INTENSITY);
         int darknessThresholdValue = settings.value("darknessThresholdValue", 20); // Load the darkness threshold slider value
         bool dynamicBrightnessEnabled = settings.value("dynamicBrightnessEnabled", false); // Load dynamic brightness state
+        mainImageScale = settings.value("mainImageScale", 0.5);  // Default to 0.5
+        motionImageScale = settings.value("motionImageScale", 0.5);
+        patternImageScale = settings.value("patternImageScale", 0.5);
 
         // Load whether darkness adjustment and color boost are enabled
         adjustBrightness = settings.value("adjustBrightness", DEFAULT_ADJUST_BRIGHTNESS);
         colorBoostEnabled = settings.value("colorBoostEnabled", DEFAULT_COLOR_BOOST_ENABLED);
+        // Load if ambilight setting is enabled
+        ambilightModeEnabled = settings.value("ambilightModeEnabled", false);
+        if (ambilightModeCheckbox) ambilightModeCheckbox->setChecked(ambilightModeEnabled);
 
         // Load lights
         lights.clear();
@@ -596,7 +875,10 @@ void LoadSettings() {
         if (colorBoostSlider) colorBoostSlider->setValue(colorBoostIntensity);
         if (darknessThresholdSlider) darknessThresholdSlider->setValue(darknessThresholdValue);
         if (dynamicBrightnessCheckbox) dynamicBrightnessCheckbox->setChecked(dynamicBrightnessEnabled);
-
+        if (mainImageScaleSlider) mainImageScaleSlider->setValue(static_cast<int>(mainImageScale.load() * 100));
+        if (motionImageScaleSlider) motionImageScaleSlider->setValue(static_cast<int>(motionImageScale.load() * 100));
+        if (patternImageScaleSlider) patternImageScaleSlider->setValue(static_cast<int>(patternImageScale.load() * 100));
+        
         std::cout << "Settings loaded successfully." << std::endl;
     } else {
         std::cerr << "Could not open settings file. Creating a default settings file." << std::endl;
@@ -605,6 +887,85 @@ void LoadSettings() {
 }
 
 
+
+std::thread previewThread;
+
+void StartPreview() {
+    if (previewsOpen) {
+        std::cout << "Preview windows are already open." << std::endl;
+        return;
+    }
+
+    previewsOpen = true;
+
+    if (previewThread.joinable()) {
+        previewThread.join();  // Ensure the previous thread is stopped
+    }
+
+    previewThread = std::thread([]() {
+        cv::Mat previousFrame;
+
+        // Initialize preview windows
+        cv::namedWindow("Optical Flow Magnitude", cv::WINDOW_NORMAL);
+        cv::namedWindow("LBP Pattern Analysis", cv::WINDOW_NORMAL);
+
+        while (previewsOpen) {
+            // Check if preview windows are still open
+            bool magnitudeWindowOpen = cv::getWindowProperty("Optical Flow Magnitude", cv::WND_PROP_VISIBLE) >= 1;
+            bool lbpWindowOpen = cv::getWindowProperty("LBP Pattern Analysis", cv::WND_PROP_VISIBLE) >= 1;
+
+            // Exit the loop if both windows are closed
+            if (!magnitudeWindowOpen && !lbpWindowOpen) {
+                previewsOpen = false;
+                break;
+            }
+
+            if (capturing) {
+                // Capture the screen for preview
+                HBITMAP hBitmap = CaptureScreen();
+                cv::Mat img = HBITMAPToMat(hBitmap);
+                cv::Mat gray;
+                cv::cvtColor(img, gray, cv::COLOR_BGR2GRAY);
+
+                if (!previousFrame.empty()) {
+                    // Calculate optical flow
+                    cv::Mat flow = calculateOpticalFlow(previousFrame, gray);
+                    cv::Mat flowChannels[2];
+                    cv::split(flow, flowChannels);
+                    cv::Mat magnitude, angle;
+                    cv::cartToPolar(flowChannels[0], flowChannels[1], magnitude, angle, true);
+                    cv::normalize(magnitude, magnitude, 0, 255, cv::NORM_MINMAX);
+                    magnitude.convertTo(magnitude, CV_8UC1);
+
+                    // Calculate LBP image
+                    auto lbpImages = calculateMultiScaleLBP(gray, {1, 2, 3});
+                    cv::Mat combinedLBP;
+                    cv::addWeighted(lbpImages[0], 0.33, lbpImages[1], 0.33, 0, combinedLBP);
+                    cv::addWeighted(combinedLBP, 1.0, lbpImages[2], 0.33, 0, combinedLBP);
+
+                    // Display previews only if windows are open
+                    if (magnitudeWindowOpen && !magnitude.empty()) {
+                        cv::imshow("Optical Flow Magnitude", magnitude);
+                    }
+
+                    if (lbpWindowOpen && !combinedLBP.empty()) {
+                        cv::imshow("LBP Pattern Analysis", combinedLBP);
+                    }
+                }
+
+                previousFrame = gray.clone();
+                DeleteObject(hBitmap);
+            }
+
+            // Keep windows responsive, even if not capturing
+            cv::waitKey(50); // Delay to allow OpenCV to process GUI events
+        }
+
+        // Destroy preview windows once previews are stopped
+        cv::destroyAllWindows();
+        std::cout << "Preview completed." << std::endl;
+    });
+}
 
 
 void SetupUI(QVBoxLayout* layout) {
@@ -618,13 +979,47 @@ void SetupUI(QVBoxLayout* layout) {
     QPushButton* selectRegionButton = new QPushButton("Select Region");
     layout->addWidget(selectRegionButton);
 
-    // Add color display
+    // Add preview button
+    QPushButton* previewButton = new QPushButton("Preview");
+    layout->addWidget(previewButton);
+
+    // Create a vertical layout for each color display box
+    QVBoxLayout* leftColorLayout = new QVBoxLayout;
+    QVBoxLayout* dominantColorLayout = new QVBoxLayout;
+    QVBoxLayout* rightColorLayout = new QVBoxLayout;
+
+    // Initialize and add color display for left color
+    leftColorLabel = new QLabel("Left Color:");
+    leftColorDisplay = new QLabel;
+    leftColorDisplay->setFixedSize(100, 50);
+    leftColorDisplay->setStyleSheet("background-color: rgb(0, 0, 0);");  // Initial color
+    leftColorLayout->addWidget(leftColorLabel);
+    leftColorLayout->addWidget(leftColorDisplay);
+
+    // Initialize and add color display for dominant color
     colorLabel = new QLabel("Dominant Color:");
     colorDisplay = new QLabel;
     colorDisplay->setFixedSize(100, 50);
     colorDisplay->setStyleSheet("background-color: rgb(0, 0, 0);");  // Initial color
-    layout->addWidget(colorLabel);
-    layout->addWidget(colorDisplay);
+    dominantColorLayout->addWidget(colorLabel);
+    dominantColorLayout->addWidget(colorDisplay);
+
+    // Initialize and add color display for right color
+    rightColorLabel = new QLabel("Right Color:");
+    rightColorDisplay = new QLabel;
+    rightColorDisplay->setFixedSize(100, 50);
+    rightColorDisplay->setStyleSheet("background-color: rgb(0, 0, 0);");  // Initial color
+    rightColorLayout->addWidget(rightColorLabel);
+    rightColorLayout->addWidget(rightColorDisplay);
+
+    // Create a horizontal layout to hold the vertical layouts
+    QHBoxLayout* colorDisplayLayout = new QHBoxLayout;
+    colorDisplayLayout->addLayout(leftColorLayout);
+    colorDisplayLayout->addLayout(dominantColorLayout);
+    colorDisplayLayout->addLayout(rightColorLayout);
+
+    // Add the horizontal layout to the main layout
+    layout->addLayout(colorDisplayLayout);
 
     // Add list widget for lights
     lightsLabel = new QLabel("WiZ Light List:");
@@ -654,17 +1049,25 @@ void SetupUI(QVBoxLayout* layout) {
     darknessThresholdSlider->setValue(20); // Default value
     layout->addWidget(darknessThresholdSlider);
 
-    // Add color boost controls
-    colorBoostCheckbox = new QCheckBox("Enable Color Boost");
-    layout->addWidget(colorBoostCheckbox);
-    colorBoostSlider = new QSlider(Qt::Horizontal);
-    colorBoostSlider->setRange(0, 100);
-    layout->addWidget(new QLabel("Color Boost Intensity"));
-    layout->addWidget(colorBoostSlider);
+    // Add maximum brightness slider
+    QLabel* maxBrightnessLabel = new QLabel("Maximum Brightness:");
+    layout->addWidget(maxBrightnessLabel);
+    QSlider* maxBrightnessSlider = new QSlider(Qt::Horizontal);
+    maxBrightnessSlider->setRange(0, 100); // Set the range to 0-100
+    maxBrightnessSlider->setValue(100); // Default value is 100%
+    layout->addWidget(maxBrightnessSlider);
 
     // Add dynamic brightness checkbox
     dynamicBrightnessCheckbox = new QCheckBox("Enable Dynamic Brightness");
     layout->addWidget(dynamicBrightnessCheckbox);
+
+    // Add color boost controls
+    colorBoostSlider = new QSlider(Qt::Horizontal);
+    colorBoostSlider->setRange(0, 100);
+    layout->addWidget(new QLabel("Color Boost Intensity"));
+    layout->addWidget(colorBoostSlider);
+    colorBoostCheckbox = new QCheckBox("Enable Color Boost");
+    layout->addWidget(colorBoostCheckbox);
 
     // Add combo boxes for selecting lights for left and right halves
     QLabel* leftLightLabel = new QLabel("Select Light for Left Half:");
@@ -679,6 +1082,31 @@ void SetupUI(QVBoxLayout* layout) {
     rightLightComboBox->addItem("None");
     layout->addWidget(rightLightComboBox);
 
+    // Add scaling sliders
+    QLabel* mainImageScaleLabel = new QLabel("Main Image Scaling:");
+    mainImageScaleSlider = new QSlider(Qt::Horizontal); // Assign to the global pointer
+    mainImageScaleSlider->setRange(10, 100);  // Scale from 0.1 to 1.0 (multiplied by 100 for UI)
+    mainImageScaleSlider->setValue(static_cast<int>(mainImageScale.load() * 100));
+    layout->addWidget(mainImageScaleLabel);
+    layout->addWidget(mainImageScaleSlider);
+
+    QLabel* motionImageScaleLabel = new QLabel("Motion Image Scaling:");
+    motionImageScaleSlider = new QSlider(Qt::Horizontal); // Assign to the global pointer
+    motionImageScaleSlider->setRange(10, 100);
+    motionImageScaleSlider->setValue(static_cast<int>(motionImageScale.load() * 100));
+    layout->addWidget(motionImageScaleLabel);
+    layout->addWidget(motionImageScaleSlider);
+
+    QLabel* patternImageScaleLabel = new QLabel("Pattern Image Scaling:");
+    patternImageScaleSlider = new QSlider(Qt::Horizontal); // Assign to the global pointer
+    patternImageScaleSlider->setRange(10, 100);
+    patternImageScaleSlider->setValue(static_cast<int>(patternImageScale.load() * 100));
+    layout->addWidget(patternImageScaleLabel);
+    layout->addWidget(patternImageScaleSlider);
+
+    ambilightModeCheckbox = new QCheckBox("Enable Ambilight Mode");
+    layout->addWidget(ambilightModeCheckbox);
+
     // Add reset to defaults button
     QPushButton* resetButton = new QPushButton("Reset to Defaults");
     layout->addWidget(resetButton);
@@ -686,9 +1114,11 @@ void SetupUI(QVBoxLayout* layout) {
     // Connect signals and slots
     QObject::connect(startButton, &QPushButton::clicked, StartScreenCapture);
     QObject::connect(stopButton, &QPushButton::clicked, StopScreenCapture);
+    QObject::connect(previewButton, &QPushButton::clicked, StartPreview); // Corrected signal-slot connection
     QObject::connect(addButton, &QPushButton::clicked, &AddLight);
     QObject::connect(removeButton, &QPushButton::clicked, &RemoveLight);
     QObject::connect(brightnessCheckbox, &QCheckBox::stateChanged, [](int state) {
+        std::cout << "Adjust Brightness Checkbox state: " << state << std::endl;
         adjustBrightness = (state == Qt::Checked);
     });
     QObject::connect(darknessSlider, &QSlider::valueChanged, [](int value) {
@@ -706,7 +1136,27 @@ void SetupUI(QVBoxLayout* layout) {
     QObject::connect(dynamicBrightnessCheckbox, &QCheckBox::stateChanged, [](int state) {
         // Handle dynamic brightness checkbox state change
     });
+    QObject::connect(ambilightModeCheckbox, &QCheckBox::stateChanged, [](int state) {
+        ambilightModeEnabled = (state == Qt::Checked);
+    });
+    QObject::connect(mainImageScaleSlider, &QSlider::valueChanged, [](int value) {
+        mainImageScale = value / 100.0;
+    });
+    QObject::connect(motionImageScaleSlider, &QSlider::valueChanged, [](int value) {
+        motionImageScale = value / 100.0;
+    });
+    QObject::connect(patternImageScaleSlider, &QSlider::valueChanged, [](int value) {
+        patternImageScale = value / 100.0;
+    });
+    QObject::connect(maxBrightnessSlider, &QSlider::valueChanged, [](int value) {
+    std::cout << "MaxBrightnessSlider value: " << value << std::endl;
+    maxBrightness = value;
+    });
     QObject::connect(selectRegionButton, &QPushButton::clicked, []() {
+        if (previewsOpen) {
+            QMessageBox::warning(nullptr, "Error", "Please close the preview windows before selecting a region.");
+            return;
+        }
         SelectScreenRegion();
     });
     QObject::connect(resetButton, &QPushButton::clicked, []() {
@@ -721,6 +1171,16 @@ void SetupUI(QVBoxLayout* layout) {
 
 
 
+
+void Cleanup() {
+    if (previewsOpen) {
+        previewsOpen = false;
+        if (previewThread.joinable()) {
+            previewThread.join();
+        }
+    }
+    cv::destroyAllWindows();
+}
 
 
 int main(int argc, char* argv[]) {
@@ -759,6 +1219,6 @@ int main(int argc, char* argv[]) {
     // Cleanup UDP socket
     CleanupUDPSocket();
     std::cout << "WiZ light UDP Socket cleaned up." << std::endl;
-
+    std::cout << "Closing threads and cleaning up, please wait..." << std::endl;
     return result;
 }
