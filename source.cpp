@@ -21,6 +21,7 @@
 #include <QtWidgets/QScrollArea>
 #include <Qtcore/QDir>
 #include <Qtcore/QTimer>
+#include <QtCore/QRegularExpression>
 #include <unordered_map>
 #include <fstream>
 #include "nlohmann/json.hpp"
@@ -30,7 +31,8 @@
 #include <future>  // For std::promise and std::future
 #include <vector>
 #include <string>
-#include <QtCore/QRegularExpression>
+#include <Qtgui/QIcon> 
+#include <QtCore/QFile>
 
 
 
@@ -71,11 +73,20 @@ struct Preset {
     double mainImageScale;
     double motionImageScale;
     double patternImageScale;
-    int maxBrightness; 
-    std::vector<Light> lights;
+    int maxBrightness;
+    int darknessThresholdValue;
+    int darknessSliderValue;
+    int darknessAdjustment;
+    std::vector<Light> lights; // Change to std::vector
 };
 
-
+QList<Light> vectorToQList(const std::vector<Light>& vector) {
+    QList<Light> list;
+    for (const auto& item : vector) {
+        list.append(item);
+    }
+    return list;
+}
 
 std::mutex lightsMutex; // Global mutex for protecting shared resources
 
@@ -1205,6 +1216,7 @@ void SaveSettings() {
     settings["motionImageScale"] = motionImageScale.load();
     settings["patternImageScale"] = patternImageScale.load();
     settings["maxBrightness"] = maxBrightness.load(); // Save max brightness
+    settings["darknessSliderValue"] = darknessSlider->value(); // Save the darkness slider value
 
     // Save whether darkness adjustment and color boost are enabled
     settings["adjustBrightness"] = adjustBrightness.load();
@@ -1273,6 +1285,8 @@ void LoadSettings() {
         motionImageScale = settings.value("motionImageScale", 0.5);
         patternImageScale = settings.value("patternImageScale", 0.5);
         maxBrightness = settings.value("maxBrightness", 100); // Load max brightness
+        int darknessSliderValue = settings.value("darknessSliderValue", 0); // Default to 0 if missing
+
 
         // Load whether darkness adjustment and color boost are enabled
         adjustBrightness = settings.value("adjustBrightness", DEFAULT_ADJUST_BRIGHTNESS);
@@ -1327,7 +1341,8 @@ void LoadSettings() {
         if (motionImageScaleSlider) motionImageScaleSlider->setValue(static_cast<int>(motionImageScale.load() * 100));
         if (patternImageScaleSlider) patternImageScaleSlider->setValue(static_cast<int>(patternImageScale.load() * 100));
         if (maxBrightnessSlider) maxBrightnessSlider->setValue(maxBrightness); // Update max brightness slider
-        
+        if (darknessSlider) darknessSlider->setValue(darknessSliderValue); // Apply the value to the slider
+
         std::cout << "Settings loaded successfully." << std::endl;
     } else {
         std::cerr << "Could not open settings file. Creating a default settings file." << std::endl;
@@ -1427,18 +1442,22 @@ void EnsurePresetsDirectoryExists() {
 
 void SavePresetToFile(const Preset& preset) {
     EnsurePresetsDirectoryExists();
+
     nlohmann::json presetJson = {
         {"name", preset.name.toStdString()},
         {"darknessThreshold", preset.darknessThreshold},
-        {"colorBoostIntensity", preset.colorBoostIntensity},
-        {"adjustBrightness", preset.adjustBrightness},
-        {"colorBoostEnabled", preset.colorBoostEnabled},
-        {"ambilightModeEnabled", preset.ambilightModeEnabled},
-        {"mainImageScale", preset.mainImageScale},
-        {"motionImageScale", preset.motionImageScale},
-        {"patternImageScale", preset.patternImageScale},
+        {"darknessSliderValue", darknessSlider->value()}, // Save darkness slider value
+        {"colorBoostIntensity", colorBoostIntensity.load()},
+        {"adjustBrightness", adjustBrightness.load()},
+        {"colorBoostEnabled", colorBoostEnabled.load()},
+        {"ambilightModeEnabled", ambilightModeEnabled.load()},
+        {"dynamicBrightnessEnabled", dynamicBrightnessCheckbox->isChecked()},
+        {"mainImageScale", mainImageScale.load()},
+        {"motionImageScale", motionImageScale.load()},
+        {"patternImageScale", patternImageScale.load()},
         {"maxBrightness", maxBrightness.load()},
-        {"dynamicBrightnessEnabled", dynamicBrightnessCheckbox->isChecked()} // Save dynamic brightness state
+        {"darknessThresholdValue", darknessThresholdSlider->value()}, // Save darkness threshold slider value
+        {"lights", nlohmann::json::array()}
     };
 
     for (const auto& light : preset.lights) {
@@ -1447,14 +1466,11 @@ void SavePresetToFile(const Preset& preset) {
             {"ipAddress", light.ipAddress.toStdString()}
         };
         if (light.name.contains("RGB (")) {
-            // Extract and save RGB values
-            QString rgbPart = light.name.split("RGB (").last().split(")").first();
-            QStringList rgbValues = rgbPart.split(", ");
+            QStringList rgbValues = light.name.split("RGB (").last().split(")").first().split(", ");
             if (rgbValues.size() == 3) {
                 lightJson["r"] = rgbValues[0].toInt();
                 lightJson["g"] = rgbValues[1].toInt();
                 lightJson["b"] = rgbValues[2].toInt();
-                // Remove the RGB part from the name to avoid duplication
                 lightJson["name"] = light.name.split("RGB (").first().trimmed().toStdString();
             }
         }
@@ -1464,6 +1480,7 @@ void SavePresetToFile(const Preset& preset) {
     std::ofstream file(presetsDirectory.toStdString() + preset.name.toStdString() + ".json");
     file << presetJson.dump(4);
 }
+
 
 Preset LoadPresetFromFile(const QString& presetName) {
     std::ifstream file(presetsDirectory.toStdString() + presetName.toStdString() + ".json");
@@ -1477,18 +1494,17 @@ Preset LoadPresetFromFile(const QString& presetName) {
     preset.adjustBrightness = presetJson["adjustBrightness"];
     preset.colorBoostEnabled = presetJson["colorBoostEnabled"];
     preset.ambilightModeEnabled = presetJson["ambilightModeEnabled"];
+    preset.dynamicBrightnessEnabled = presetJson["dynamicBrightnessEnabled"];
     preset.mainImageScale = presetJson["mainImageScale"];
     preset.motionImageScale = presetJson["motionImageScale"];
     preset.patternImageScale = presetJson["patternImageScale"];
-    preset.maxBrightness = presetJson.value("maxBrightness", 100);
-    bool dynamicBrightnessEnabled = presetJson.value("dynamicBrightnessEnabled", false); // Load dynamic brightness state
-
-    std::cout << "Loaded dynamicBrightnessEnabled: " << dynamicBrightnessEnabled << std::endl;
+    preset.maxBrightness = presetJson["maxBrightness"];
+    preset.darknessThresholdValue = presetJson["darknessThresholdValue"]; // Load darkness threshold slider value
+    preset.darknessSliderValue = presetJson.value("darknessSliderValue", 0); // Load darkness slider value
 
     for (const auto& lightJson : presetJson["lights"]) {
         QString lightName = QString::fromStdString(lightJson["name"]);
         if (lightJson.contains("r") && lightJson.contains("g") && lightJson.contains("b")) {
-            // Format RGB text
             QString rgbText = QString("<span style='color: rgb(%1, %2, %3);'>RGB (%1, %2, %3)</span>")
                               .arg(lightJson["r"].get<int>())
                               .arg(lightJson["g"].get<int>())
@@ -1501,12 +1517,6 @@ Preset LoadPresetFromFile(const QString& presetName) {
         preset.lights.push_back(light);
     }
 
-    // Update the dynamicBrightnessCheckbox state
-    QMetaObject::invokeMethod(dynamicBrightnessCheckbox, [dynamicBrightnessEnabled]() {
-        dynamicBrightnessCheckbox->setChecked(dynamicBrightnessEnabled);
-        std::cout << "Set dynamicBrightnessCheckbox to: " << dynamicBrightnessEnabled << std::endl;
-    }, Qt::QueuedConnection);
-
     return preset;
 }
 
@@ -1518,70 +1528,52 @@ void DeletePresetFile(const QString& presetName) {
 void SavePreset(const QString& presetName) {
     Preset preset;
     preset.name = presetName;
-    preset.darknessThreshold = darknessThreshold.load();
-    preset.colorBoostIntensity = colorBoostIntensity.load();
-    preset.adjustBrightness = adjustBrightness.load();
-    preset.colorBoostEnabled = colorBoostEnabled.load();
-    preset.ambilightModeEnabled = ambilightModeEnabled.load();
-    preset.mainImageScale = mainImageScale.load();
-    preset.motionImageScale = motionImageScale.load();
-    preset.patternImageScale = patternImageScale.load();
-    preset.lights = lights;
+    preset.darknessThreshold = darknessThreshold.load();      // Save darkness threshold
+    preset.colorBoostIntensity = colorBoostIntensity.load();  // Save color boost intensity
+    preset.adjustBrightness = adjustBrightness.load();        // Save brightness adjustment state
+    preset.colorBoostEnabled = colorBoostEnabled.load();      // Save color boost state
+    preset.ambilightModeEnabled = ambilightModeEnabled.load();// Save ambilight mode state
+    preset.dynamicBrightnessEnabled = dynamicBrightnessCheckbox->isChecked(); // Save dynamic brightness state
+    preset.mainImageScale = mainImageScale.load();            // Save main image scale
+    preset.motionImageScale = motionImageScale.load();        // Save motion image scale
+    preset.patternImageScale = patternImageScale.load();      // Save pattern image scale
+    preset.maxBrightness = maxBrightness.load();              // Save max brightness
+    preset.lights = lights;                                   // Save lights
+    preset.darknessAdjustment = darknessSlider->value();      // Save darkness slider value
+    preset.darknessSliderValue = darknessSlider->value();     // Save darkness slider value
+    preset.darknessThresholdValue = darknessThresholdSlider->value(); // Save darkness threshold slider value
 
-    SavePresetToFile(preset);
+    SavePresetToFile(preset); // Save preset to file
 }
 
+
 void LoadPreset(const QString& presetName) {
-    std::cout << "Loading preset: " << presetName.toStdString() << std::endl;
-
     Preset preset = LoadPresetFromFile(presetName);
-    std::cout << "Preset loaded from file: " << presetName.toStdString() << std::endl;
 
+    // Update logic variables
     darknessThreshold = preset.darknessThreshold;
     colorBoostIntensity = preset.colorBoostIntensity;
     adjustBrightness = preset.adjustBrightness;
     colorBoostEnabled = preset.colorBoostEnabled;
     ambilightModeEnabled = preset.ambilightModeEnabled;
-    mainImageScale = preset.mainImageScale;
-    motionImageScale = preset.motionImageScale;
-    patternImageScale = preset.patternImageScale;
     maxBrightness = preset.maxBrightness;
-    lights = preset.lights;
 
-    std::cout << "Updating UI elements" << std::endl;
-
-    auto updateUiElements = [preset]() {
+    // Update UI elements
+    QMetaObject::invokeMethod(QApplication::instance(), [preset]() {
         brightnessCheckbox->setChecked(preset.adjustBrightness);
-        std::cout << "Updated brightnessCheckbox" << std::endl;
-
-        darknessSlider->setValue(preset.darknessThreshold);
-        std::cout << "Updated darknessSlider" << std::endl;
-
+        darknessThresholdSlider->setMaximum(100); // Ensure the maximum value is set to 255
+        darknessThresholdSlider->setValue(preset.darknessThresholdValue);
+        darknessSlider->setMaximum(255); // Ensure the maximum value is set to 255
+        darknessSlider->setValue(preset.darknessSliderValue); 
         colorBoostCheckbox->setChecked(preset.colorBoostEnabled);
-        std::cout << "Updated colorBoostCheckbox" << std::endl;
-
         colorBoostSlider->setValue(preset.colorBoostIntensity);
-        std::cout << "Updated colorBoostSlider" << std::endl;
-
-        darknessThresholdSlider->setValue(preset.darknessThreshold);
-        std::cout << "Updated darknessThresholdSlider" << std::endl;
-
-        dynamicBrightnessCheckbox->setChecked(preset.dynamicBrightnessEnabled); // Ensure correct state
-        std::cout << "Updated dynamicBrightnessCheckbox" << std::endl;
-
+        dynamicBrightnessCheckbox->setChecked(preset.dynamicBrightnessEnabled);
         mainImageScaleSlider->setValue(static_cast<int>(preset.mainImageScale * 100));
-        std::cout << "Updated mainImageScaleSlider" << std::endl;
-
         motionImageScaleSlider->setValue(static_cast<int>(preset.motionImageScale * 100));
-        std::cout << "Updated motionImageScaleSlider" << std::endl;
-
         patternImageScaleSlider->setValue(static_cast<int>(preset.patternImageScale * 100));
-        std::cout << "Updated patternImageScaleSlider" << std::endl;
-
-        maxBrightnessSlider->setValue(preset.maxBrightness); // Update max brightness slider
-        std::cout << "Updated maxBrightnessSlider to: " << preset.maxBrightness << std::endl;
-    };
-    QMetaObject::invokeMethod(QApplication::instance(), updateUiElements, Qt::QueuedConnection);
+        maxBrightnessSlider->setValue(preset.maxBrightness);
+        ambilightModeCheckbox->setChecked(preset.ambilightModeEnabled);
+    }, Qt::QueuedConnection);
 
     // Update light list
     lightList->clear();
@@ -1590,27 +1582,17 @@ void LoadPreset(const QString& presetName) {
     leftLightComboBox->addItem("None");
     rightLightComboBox->addItem("None");
 
-    for (const auto& light : lights) {
+    for (const auto& light : preset.lights) {
         QListWidgetItem* item = new QListWidgetItem();
         QLabel* label = new QLabel(light.name);
-        label->setTextFormat(Qt::RichText); // Set text format to Rich Text
+        label->setTextFormat(Qt::RichText);
         lightList->addItem(item);
         lightList->setItemWidget(item, label);
-        leftLightComboBox->addItem(light.name);
-        rightLightComboBox->addItem(light.name);
+        leftLightComboBox->addItem(removeHtmlTags(light.name));
+        rightLightComboBox->addItem(removeHtmlTags(light.name));
     }
 
-    std::cout << "Light list updated" << std::endl;
-
-    // Ensure currentPresetLabel is not null before updating
-    if (currentPresetLabel) {
-        QMetaObject::invokeMethod(currentPresetLabel, [presetName]() {
-            currentPresetLabel->setText("Current Preset: " + presetName);
-            std::cout << "Updated currentPresetLabel" << std::endl;
-        }, Qt::QueuedConnection);
-    }
-
-    std::cout << "Preset loaded successfully" << std::endl;
+    std::cout << "Preset loaded successfully: " << presetName.toStdString() << std::endl;
 }
 
 
@@ -1792,7 +1774,7 @@ void SetupUI(QVBoxLayout* layout) {
     darknessSliderValueLabel->setAlignment(Qt::AlignCenter);
     darknessSliderValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(15); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     // Add the label for darkness threshold
     QLabel* darknessThresholdLabel = new QLabel("Darkness Threshold:");
@@ -1811,7 +1793,7 @@ void SetupUI(QVBoxLayout* layout) {
     darknessThresholdValueLabel->setAlignment(Qt::AlignCenter);
     darknessThresholdValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(15); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     // Add maximum brightness slider
     QLabel* maxBrightnessLabel = new QLabel("Maximum Brightness:");
@@ -1828,7 +1810,7 @@ void SetupUI(QVBoxLayout* layout) {
     maxBrightnessValueLabel->setAlignment(Qt::AlignCenter);
     maxBrightnessValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(20); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     // Add dynamic brightness checkbox
     dynamicBrightnessCheckbox = new QCheckBox("Enable Dynamic Brightness");
@@ -1847,7 +1829,7 @@ void SetupUI(QVBoxLayout* layout) {
     colorBoostValueLabel->setAlignment(Qt::AlignCenter);
     colorBoostValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(20); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     colorBoostCheckbox = new QCheckBox("Enable Color Boost");
     scrollLayout->addWidget(colorBoostCheckbox);
@@ -1867,7 +1849,7 @@ void SetupUI(QVBoxLayout* layout) {
     mainImageScaleValueLabel->setAlignment(Qt::AlignCenter);
     mainImageScaleValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(15); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     QLabel* motionImageScaleLabel = new QLabel("Motion Image Scaling:");
     motionImageScaleSlider = new QSlider(Qt::Horizontal); // Assign to the global pointer
@@ -1883,7 +1865,7 @@ void SetupUI(QVBoxLayout* layout) {
     motionImageScaleValueLabel->setAlignment(Qt::AlignCenter);
     motionImageScaleValueLabel->setFixedSize(30, 20);
 
-    scrollLayout->addSpacing(15); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     QLabel* patternImageScaleLabel = new QLabel("Pattern Image Scaling:");
     patternImageScaleSlider = new QSlider(Qt::Horizontal); // Assign to the global pointer
@@ -1900,7 +1882,7 @@ void SetupUI(QVBoxLayout* layout) {
     patternImageScaleValueLabel->setFixedSize(30, 20);
 
 
-    scrollLayout->addSpacing(20); // spacing between gui elements
+    scrollLayout->addSpacing(25); // spacing between gui elements
 
     ambilightModeCheckbox = new QCheckBox("Enable Ambilight Mode");
     scrollLayout->addWidget(ambilightModeCheckbox);
@@ -2007,7 +1989,7 @@ void SetupUI(QVBoxLayout* layout) {
     QObject::connect(darknessSlider, &QSlider::valueChanged, [=](int value) {
         // Update the value label text
         darknessSliderValueLabel->setText(QString::number(value));
-
+        darknessThreshold = value;
         // Set font and style
         QFont font = darknessSliderValueLabel->font();
         font.setPointSize(10);
@@ -2566,18 +2548,54 @@ void Cleanup() {
 }
 
 
+
+
+void showConsole() {
+    AllocConsole();
+    freopen("CONOUT$", "w", stdout);
+    freopen("CONOUT$", "w", stderr);
+}
+
 int main(int argc, char* argv[]) {
+    bool debugMode = false;
+
+    // Check for debug flag to show console
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "-debug") == 0) {
+            debugMode = true;
+            showConsole();
+        }
+    }
+    // Declare current version
+   if (debugMode) std::cout << "WiZio version: 0.0.7" << std::endl;
     // Initialize UDP socket
     InitUDPSocket();
-    std::cout << "WiZ light UDP Socket initialized." << std::endl;
+    if (debugMode) std::cout << "WiZ light UDP Socket initialized." << std::endl;
 
     // Initialize Qt application
     QApplication app(argc, argv);
 
+    // Load and apply stylesheet globally
+    QFile file(":/styles.qss");
+    std::cerr << "Failed to load stylesheet!" << std::endl;
+    if (file.open(QFile::ReadOnly)) {
+        QString style = QLatin1String(file.readAll());
+        app.setStyleSheet(style);
+    }
+
     // Create main window
     QMainWindow window;
-    window.setWindowTitle("WiZ Light Screen Sync");
+    window.setWindowTitle("WiZio - WiZ Light Screen Sync");
     window.resize(400, 300);
+
+    // Set window icon from resource file
+    QIcon icon(":/icons/2wizvidicon.ico");  // Use the path defined in the .qrc file
+    if (icon.isNull()) {
+        std::cerr << "Failed to load icon from resource!" << std::endl;
+    } else {
+        window.setWindowIcon(icon);
+    }
+
 
     // Create central widget and layout
     QWidget* centralWidget = new QWidget;
@@ -2587,7 +2605,7 @@ int main(int argc, char* argv[]) {
 
     // Show the window
     window.show();
-    std::cout << "Main window loaded." << std::endl;
+    if (debugMode) std::cout << "Main window loaded." << std::endl;
 
     // Populate the monitor list
     PopulateMonitorComboBox();  // Ensure this is called here
@@ -2600,11 +2618,16 @@ int main(int argc, char* argv[]) {
 
     // Save settings to file
     SaveSettings();
-    std::cout << "Settings saved." << std::endl;
+    if (debugMode) std::cout << "Settings saved." << std::endl;
 
     // Cleanup UDP socket
     CleanupUDPSocket();
-    std::cout << "WiZ light UDP Socket cleaned up." << std::endl;
-    std::cout << "Closing threads and cleaning up, please wait..." << std::endl;
+    if (debugMode) std::cout << "WiZ light UDP Socket cleaned up." << std::endl;
+    if (debugMode) std::cout << "Closing threads and cleaning up, please wait..." << std::endl;
+
     return result;
+}
+
+int CALLBACK WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
+    return main(__argc, __argv);
 }
