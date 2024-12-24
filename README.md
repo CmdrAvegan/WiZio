@@ -1,6 +1,6 @@
-# WiZ Light Screen Sync
+# WiZio - WiZ Light Screen Sync
 
-WiZ Light Screen Sync is a C++ application that dynamically synchronizes the colors of your WiZ smart lights with the dominant colors of your computer screen. This project is designed for users who want an immersive lighting experience that matches their screen's content in real-time.
+WiZio Light Screen Sync is a C++ application that dynamically synchronizes the colors of your WiZ smart lights with the dominant colors of your computer screen. This project is designed for users who want an immersive lighting experience that matches their screen's content in real-time.
 
 ## Features
 
@@ -10,7 +10,8 @@ WiZ Light Screen Sync is a C++ application that dynamically synchronizes the col
 - **Brightness and Color Adjustment**: Includes options for dynamic brightness and color boost to enhance the visual effect.
 - **Settings Persistence**: Save and load light configurations and user preferences to/from a settings file.
 - **Customizable Controls**: Adjust brightness, color boost, and darkness threshold directly from the GUI.
-
+- **Presets**: Save, load, rename and delete custom preset settings easily.
+- **Multi-Monitor Support**: Select which monitor to capture from.
 ## Prerequisites
 
 - **WiZ Smart Lights**: Compatible with WiZ smart bulbs.
@@ -21,7 +22,15 @@ WiZ Light Screen Sync is a C++ application that dynamically synchronizes the col
   - [Qt](https://www.qt.io/): For the GUI.
   - [nlohmann/json](https://github.com/nlohmann/json): For settings management.
 
-## Installation
+## Installation (Setup Installer)
+
+1. Download the Installer
+
+2. Follow the on-screen instructions to install
+
+3. Launch the program 
+
+## Installation (Building from source)
 
 1. Clone the repository:
     ```bash
@@ -49,11 +58,12 @@ WiZ Light Screen Sync is a C++ application that dynamically synchronizes the col
 ## Usage
 
 1. Launch the application.
-2. Add your WiZ lights by entering their name and IP address.
-3. (Optional) Use the **Select Region** button to define a specific area of the screen to monitor.
-4. Use the dropdown menus to assign lights to the left and right halves of the screen.
-5. Click **Start** to begin syncing.
-6. Adjust brightness, color boost, and other settings using the provided sliders and checkboxes.
+2. Add your WiZ lights by using the discover button or by entering their name and IP address.
+3. Remove any light you do not wish to use from the list.
+4. (Optional) Use the **Select Region** button to define a specific area of the screen to monitor.
+5. (Optional) Use the dropdown menus to assign lights to the left and right halves of the screen.
+6. Click **Start** to begin syncing.
+7. Adjust brightness, color boost, and other settings using the provided sliders and checkboxes.
 
 ## Configuration Files
 
@@ -63,20 +73,20 @@ Settings are saved in a JSON file named `settings.json` in the application's dir
 
 You can modify this file manually or reset settings to defaults using the **Reset to Defaults** button in the GUI.
 
-## Screenshots
+## Preset Files
 
-*(Add screenshots of the application here)*
+Presets are saved in the 'presets' directory as .json files and can be modified manually if needed.
 
 ## Known Issues
 
-- **Limited Light Discovery**: Lights must be added manually by entering their IP address.
-- **Single Monitor Support**: Currently optimized for single-monitor setups.
+- **GUI Updates**: Slider value labels appear blank before adjusting the slider.
+- **Maximum Brightness Value**: Currently does not override the maximum brightness of the light.
 - **Performance**: May exhibit slight delays on lower-spec systems during real-time processing.
 
 ## Future Enhancements
 
-- Automatic discovery of WiZ lights on the network.
-- Enhanced multi-monitor support.
+- Enhanced pattern and motion analysis for improved light effects.
+- Improved brightness and darkness options.
 - Additional region-selection options.
 
 ## License
@@ -89,7 +99,7 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 
 ## Contact
 
-For questions or feedback, feel free to reach out at your.email@example.com.
+For questions or feedback, feel free to reach out in the discussions.
 
 
 
