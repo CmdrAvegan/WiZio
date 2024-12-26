@@ -102,5 +102,11 @@ Contributions are welcome! Please open an issue or submit a pull request if you 
 For questions or feedback, feel free to reach out in the discussions.
 
 
+## Screenshots
 
+![WiZio_Dominant_Color](https://github.com/user-attachments/assets/b35a1f6a-558f-4c95-8f1c-77b82b8390b2)
+![WiZio_LeftRight_Color](https://github.com/user-attachments/assets/cbee9d3f-a41d-4e48-bfd0-cafaf8c05711)
+![WiZio_Region_Select_LeftRight_Color](https://github.com/user-attachments/assets/4db7d7b1-0062-4743-9487-ca6b81fb176c)
 
+![WiZio_GUI_Preview_Top](https://github.com/user-attachments/assets/9ee294e0-8d04-4a91-b6f5-a03f07d27075)
+![WiZio_GUI_Preview_Bottom](https://github.com/user-attachments/assets/4755bc56-6c8b-4636-88ac-7df1fae976f7)
